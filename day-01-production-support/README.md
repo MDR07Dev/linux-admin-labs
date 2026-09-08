@@ -23,37 +23,13 @@ The baseline checks established OS/kernel, hostname, IP/network, storage, memory
 
 ## Connectivity
 
-Both VMs were tested in both directions:
-
-```bash
-ping 192.168.1.3
-ping 192.168.1.2
-```
-
-Both directions succeeded with 4/4 replies and 0% packet loss.
+Both VMs were tested in both directions. Ping succeeded with 4/4 replies and 0% packet loss in both directions.
 
 An SSH attempt reached host-key verification. The observed `Host key verification failed` result was **not** treated as proof that the SSH service itself was down.
 
 ## SkyRoute Shared Directory
 
-```bash
-sudo mkdir -p /opt/skyroute
-sudo mkdir -p /opt/skyroute/{bin,config,logs,data}
-```
-
-`appuser` and `supportuser` were members of the shared `appteam` group. The application directory was configured as:
-
-```text
-drxrwsr-x. root appteam /opt/skyroute
-```
-
-More precisely, the observed mode was:
-
-```text
-drwxrwsr-x. root appteam /opt/skyroute
-```
-
-The `s` in the group position is the **setgid** bit. It causes newly created files/directories beneath the directory to inherit the `appteam` group.
+`appuser` and `supportuser` were members of the shared `appteam` group. `/opt/skyroute` and its application subdirectories were configured with `root:appteam` ownership and setgid permissions (`drwxrwsr-x`), providing shared group access and group inheritance.
 
 ## SIO-2 Investigation
 
@@ -67,113 +43,56 @@ The `s` in the group position is the **setgid** bit. It causes newly created fil
 
 ### Reproduction as `supportuser`
 
-```bash
-su - supportuser
-whoami
-id
-cd /opt/skyroute
-touch test.txt
-ls -l test.txt
-stat test.txt
-```
-
-Results:
-
-- Correct user identity confirmed.
-- `supportuser` belonged to `appteam`.
-- Directory access succeeded.
-- File creation succeeded.
-- File showed `supportuser` as owner and `appteam` as group.
-
-Modification also succeeded:
-
-```bash
-echo "SkyRoute production test" > test.txt
-cat test.txt
-```
+The user identity and group membership were verified. `supportuser` successfully entered `/opt/skyroute`, created `test.txt`, inspected it with `ls`/`stat`, and modified its contents.
 
 ### Cross-user shared access
 
-`appuser` was tested against the file created by `supportuser`:
-
-```bash
-su - appuser
-whoami
-id
-cd /opt/skyroute
-echo "appuser update" > test.txt
-cat test.txt
-```
-
-This succeeded, confirming shared group write access.
+`appuser` successfully modified the file created by `supportuser`, confirming shared group write access.
 
 ### Application subdirectories
 
-```bash
-for dir in bin config data logs; do
-  echo "=== $dir ==="
-  touch "/opt/skyroute/$dir/test.txt"
-  echo "exit_code=$?"
-done
-```
-
-All four tests returned `exit_code=0`.
+File creation was tested in `bin`, `config`, `data`, and `logs`. All four operations returned `exit_code=0`.
 
 ## Deeper Access-Control Checks
 
 ### Path traversal
 
-```bash
-namei -l /opt/skyroute/test.txt
-```
-
-Confirmed required traversal permissions through `/` and `/opt`.
+`namei -l /opt/skyroute/test.txt` confirmed the required traversal permissions through `/` and `/opt` and the expected permissions on `/opt/skyroute` and the test file.
 
 ### POSIX ACLs
 
-```bash
-getfacl /opt/skyroute
-getfacl /opt/skyroute/test.txt
-```
-
-No additional ACL entries were present beyond the standard owner/group/other permissions.
+`getfacl` checks showed no additional ACL entries beyond standard owner/group/other permissions.
 
 ### SELinux
 
-```bash
-ls -Zd /opt/skyroute
-ls -Z /opt/skyroute
-sudo ausearch -m AVC -ts recent
-```
-
-The observed contexts were consistent with the lab environment, and `ausearch` returned no recent AVC matches. There was no evidence that SELinux denied the tested operations.
+SELinux contexts were checked and `sudo ausearch -m AVC -ts recent` returned no recent AVC matches. There was no evidence that SELinux denied the tested operations.
 
 ## Application / Service Investigation
 
-```bash
-ps -ef | grep -i skyroute
-systemctl --type=service --state=running
-systemctl --failed
-ss -lntp
-```
+No SkyRoute-specific process was running. No failed systemd units were reported. Apache `httpd` was running and port 80 was listening.
 
-- No SkyRoute-specific process was running; only the `grep` process appeared.
-- No failed systemd units were reported.
-- Apache `httpd` was running and port 80 was listening.
-
-Apache was then checked:
-
-```bash
-sudo systemctl status httpd --no-pager
-apachectl -S
-curl -I http://localhost
-sudo tail -n 30 /var/log/httpd/error_log
-grep -R "DocumentRoot" /etc/httpd/conf /etc/httpd/conf.d
-```
-
-`curl -I http://localhost` returned **HTTP 403 Forbidden**. Apache's error log identified the cause: `/var/www/html/` had no matching `DirectoryIndex` and directory listing was forbidden. `DocumentRoot` was `/var/www/html`.
+A local Apache request returned **HTTP 403 Forbidden**. The Apache error log identified the cause as `/var/www/html/` having no matching `DirectoryIndex` while directory listing was forbidden. `DocumentRoot` was `/var/www/html`.
 
 This was documented as a **separate Apache/content configuration finding**, not the cause of SIO-2.
+
+## Final Verification — Ubuntu to Rocky HTTP
+
+Without rebooting Rocky or restarting Apache, Ubuntu was used to verify external HTTP connectivity:
+
+```bash
+curl http://192.168.1.2
+```
+
+The request returned the Rocky Linux Apache HTTP Server Test Page successfully.
+
+This confirmed:
+
+- Ubuntu could reach Rocky over the network.
+- TCP/HTTP port 80 was reachable.
+- Apache was serving content successfully.
+- No Apache restart was required for this verification.
+
+The successful remote test also reinforced the earlier conclusion that the Apache observation was a separate webroot/content configuration finding rather than an HTTP service outage.
 
 ## Final SIO-2 Assessment
 
@@ -187,10 +106,13 @@ Evidence showed that:
 - POSIX ACLs did not introduce a restriction.
 - No recent SELinux AVC denial was found.
 - Both `supportuser` and `appuser` could create/modify files in the tested application paths.
+- HTTP connectivity from Ubuntu to Rocky was verified successfully without restarting the Rocky host or Apache.
 
-No filesystem access-control root cause was established.
+No filesystem access-control root cause was established and no corrective system change was required.
 
-The Jira ticket was updated with the evidence and left **Open** rather than being closed prematurely. The correct next step, if the issue must be pursued, is to obtain the original failing operation, affected file/application component, exact error message, and approximate time of failure.
+The exact original failure remains unknown. If the issue recurs, the next evidence required is the original failing operation, affected path/file, exact error message, user/account, timestamp, and application context so the incident can be reproduced under equivalent conditions.
+
+**Closure disposition:** Not Reproducible / No Root Cause Established.
 
 ## Production-Support Mindset
 
@@ -209,4 +131,6 @@ Key lessons:
 
 ## Jira
 
-**SIO-2:** [INC-001 — SkyRoute application directory access failure](https://rafeeqdocs.atlassian.net/browse/SIO-2)
+**SIO-2:** INC-001 — SkyRoute application directory access failure  
+**Disposition:** Not Reproducible / No Root Cause Established  
+**Status:** Closed after final verification and closure documentation.
